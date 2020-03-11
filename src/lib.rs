@@ -100,7 +100,6 @@ Bumpalo is a `no_std` crate. It depends only on the `alloc` and `core` crates.
  */
 
 #![deny(missing_debug_implementations)]
-#![deny(missing_docs)]
 #![no_std]
 #![cfg_attr(feature = "nightly", feature(allocator_api, alloc_layout_extra))]
 
@@ -119,6 +118,8 @@ use core::ptr::{self, NonNull};
 use core::slice;
 use core::str;
 use core_alloc::alloc::{alloc, dealloc, Layout};
+
+use self::alloc::{AllocRef, AllocErr, AllocInit, ReallocPlacement, MemoryBlock};
 
 /// An arena to bump allocate into.
 ///
@@ -1072,10 +1073,13 @@ fn oom() -> ! {
     panic!("out of memory")
 }
 
-unsafe impl<'a> alloc::AllocRef for &'a Bump {
+unsafe impl<'a> AllocRef for &'a Bump {
     #[inline(always)]
-    unsafe fn alloc(&mut self, layout: Layout) -> Result<NonNull<u8>, alloc::AllocErr> {
-        Ok(self.alloc_layout(layout))
+    fn alloc(&mut self, layout: Layout, init: AllocInit) -> Result<MemoryBlock, AllocErr> {
+        let layout_size = layout.size();
+        let block = MemoryBlock { ptr: self.alloc_layout(layout), size: layout_size };
+        unsafe { AllocInit::init(init, block); }
+        Ok(block)
     }
 
     #[inline]
@@ -1088,41 +1092,8 @@ unsafe impl<'a> alloc::AllocRef for &'a Bump {
         }
     }
 
-    #[inline]
-    unsafe fn realloc(
-        &mut self,
-        ptr: NonNull<u8>,
-        layout: Layout,
-        new_size: usize,
-    ) -> Result<NonNull<u8>, alloc::AllocErr> {
+    unsafe fn grow(&mut self, ptr: NonNull<u8>, layout: Layout, new_size: usize, placement: ReallocPlacement, init: AllocInit) -> Result<MemoryBlock, AllocErr> {
         let old_size = layout.size();
-
-        if old_size == 0 {
-            return self.alloc(layout);
-        }
-
-        if new_size <= old_size {
-            if self.is_last_allocation(ptr)
-                // Only reclaim the excess space (which requires a copy) if it
-                // is worth it: we are actually going to recover "enough" space
-                // and we can do a non-overlapping copy.
-                && new_size <= old_size / 2
-            {
-                let delta = old_size - new_size;
-                let footer = self.current_chunk_footer.get();
-                let footer = footer.as_ref();
-                footer
-                    .ptr
-                    .set(NonNull::new_unchecked(footer.ptr.get().as_ptr().add(delta)));
-                let new_ptr = footer.ptr.get();
-                // NB: we know it is non-overlapping because of the size check
-                // in the `if` condition.
-                ptr::copy_nonoverlapping(ptr.as_ptr(), new_ptr.as_ptr(), new_size);
-                return Ok(new_ptr);
-            } else {
-                return Ok(ptr);
-            }
-        }
 
         if self.is_last_allocation(ptr) {
             // Try to allocate the delta size within this same block so we can
@@ -1132,15 +1103,52 @@ unsafe impl<'a> alloc::AllocRef for &'a Bump {
                 self.try_alloc_layout_fast(layout_from_size_align(delta, layout.align()))
             {
                 ptr::copy(ptr.as_ptr(), p.as_ptr(), new_size);
-                return Ok(p);
+                let block = MemoryBlock { ptr: p, size: new_size };
+                AllocInit::init_offset(init, block, old_size);
+                return Ok(block);
             }
+        }
+
+        // Honor ReallocPlacement
+        if placement != ReallocPlacement::MayMove {
+            return Err(AllocErr);
         }
 
         // Fallback: do a fresh allocation and copy the existing data into it.
         let new_layout = layout_from_size_align(new_size, layout.align());
+        let new_layout_size = new_layout.size();
         let new_ptr = self.alloc_layout(new_layout);
         ptr::copy_nonoverlapping(ptr.as_ptr(), new_ptr.as_ptr(), old_size);
-        Ok(new_ptr)
+        let block = MemoryBlock { ptr: new_ptr, size: new_layout_size };
+        AllocInit::init_offset(init, block, old_size);
+        Ok(block)
+    }
+
+
+    unsafe fn shrink(&mut self, ptr: NonNull<u8>, layout: Layout, new_size: usize, placement: ReallocPlacement) -> Result<MemoryBlock, AllocErr> {
+        let old_size = layout.size();
+
+        if self.is_last_allocation(ptr)
+            // Only reclaim the excess space (which requires a copy) if it
+            // is worth it: we are actually going to recover "enough" space
+            // and we can do a non-overlapping copy.
+            && new_size <= old_size / 2
+            && placement == ReallocPlacement::MayMove
+        {
+            let delta = old_size - new_size;
+            let footer = self.current_chunk_footer.get();
+            let footer = footer.as_ref();
+            footer
+                .ptr
+                .set(NonNull::new_unchecked(footer.ptr.get().as_ptr().add(delta)));
+            let new_ptr = footer.ptr.get();
+            // NB: we know it is non-overlapping because of the size check
+            // in the `if` condition.
+            ptr::copy_nonoverlapping(ptr.as_ptr(), new_ptr.as_ptr(), new_size);
+            Ok(MemoryBlock { ptr: new_ptr, size: new_size })
+        } else {
+            Ok(MemoryBlock { ptr, size: new_size })
+        }
     }
 }
 
@@ -1151,54 +1159,5 @@ mod tests {
     #[test]
     fn chunk_footer_is_five_words() {
         assert_eq!(mem::size_of::<ChunkFooter>(), mem::size_of::<usize>() * 5);
-    }
-
-    #[test]
-    #[allow(clippy::cognitive_complexity)]
-    fn test_realloc() {
-        use crate::alloc::AllocRef;
-
-        unsafe {
-            const CAPACITY: usize = 1024 - OVERHEAD;
-            let mut b = Bump::with_capacity(CAPACITY);
-
-            // `realloc` doesn't shrink allocations that aren't "worth it".
-            let layout = Layout::from_size_align(100, 1).unwrap();
-            let p = b.alloc_layout(layout);
-            let q = (&b).realloc(p, layout, 51).unwrap();
-            assert_eq!(p, q);
-            b.reset();
-
-            // `realloc` will shrink allocations that are "worth it".
-            let layout = Layout::from_size_align(100, 1).unwrap();
-            let p = b.alloc_layout(layout);
-            let q = (&b).realloc(p, layout, 50).unwrap();
-            assert!(p != q);
-            b.reset();
-
-            // `realloc` will reuse the last allocation when growing.
-            let layout = Layout::from_size_align(10, 1).unwrap();
-            let p = b.alloc_layout(layout);
-            let q = (&b).realloc(p, layout, 11).unwrap();
-            assert_eq!(q.as_ptr() as usize, p.as_ptr() as usize - 1);
-            b.reset();
-
-            // `realloc` will allocate a new chunk when growing the last
-            // allocation, if need be.
-            let layout = Layout::from_size_align(1, 1).unwrap();
-            let p = b.alloc_layout(layout);
-            let q = (&b).realloc(p, layout, CAPACITY + 1).unwrap();
-            assert!(q.as_ptr() as usize != p.as_ptr() as usize - CAPACITY);
-            b = Bump::with_capacity(CAPACITY);
-
-            // `realloc` will allocate and copy when reallocating anything that
-            // wasn't the last allocation.
-            let layout = Layout::from_size_align(1, 1).unwrap();
-            let p = b.alloc_layout(layout);
-            let _ = b.alloc_layout(layout);
-            let q = (&b).realloc(p, layout, 2).unwrap();
-            assert!(q.as_ptr() as usize != p.as_ptr() as usize - 1);
-            b.reset();
-        }
     }
 }

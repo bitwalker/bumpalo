@@ -17,7 +17,7 @@ use core::cmp;
 use core::mem;
 use core::ptr::{self, NonNull};
 
-use crate::alloc::{handle_alloc_error, Alloc, Layout};
+use crate::alloc::{handle_alloc_error, AllocRef, AllocErr, Layout};
 #[allow(unused_imports)]
 use crate::alloc::UnstableLayoutMethods;
 
@@ -106,12 +106,12 @@ impl<'a, T> RawVec<'a, T> {
                 let align = mem::align_of::<T>();
                 let layout = Layout::from_size_align(alloc_size, align).unwrap();
                 let result = if zeroed {
-                    a.alloc_zeroed(layout)
+                    alloc_zeroed_with(&mut a, layout)
                 } else {
-                    Alloc::alloc(&mut a, layout)
+                    alloc_with(&mut a, layout)
                 };
                 match result {
-                    Ok(ptr) => ptr.cast(),
+                    Ok((ptr, _)) => ptr.cast(),
                     Err(_) => handle_alloc_error(layout),
                 }
             };
@@ -250,9 +250,9 @@ impl<'a, T> RawVec<'a, T> {
                     let new_cap = 2 * self.cap;
                     let new_size = new_cap * elem_size;
                     alloc_guard(new_size).unwrap_or_else(|_| capacity_overflow());
-                    let ptr_res = self.a.realloc(self.ptr.cast(), cur, new_size);
+                    let ptr_res = realloc_with(&mut self.a, self.ptr.cast(), cur, new_size);
                     match ptr_res {
-                        Ok(ptr) => (new_cap, ptr.cast()),
+                        Ok((ptr, _)) => (new_cap, ptr.cast()),
                         Err(_) => handle_alloc_error(Layout::from_size_align_unchecked(
                             new_size,
                             cur.align(),
@@ -263,13 +263,14 @@ impl<'a, T> RawVec<'a, T> {
                     // skip to 4 because tiny Vec's are dumb; but not if that
                     // would cause overflow
                     let new_cap = if elem_size > (!0) / 8 { 1 } else { 4 };
-                    match self.a.alloc_array::<T>(new_cap) {
-                        Ok(ptr) => (new_cap, ptr),
+                    let layout = Layout::array::<T>(new_cap).unwrap();
+                    match alloc_with(&mut self.a, layout) {
+                        Ok((ptr, _)) => (new_cap, ptr),
                         Err(_) => handle_alloc_error(Layout::array::<T>(new_cap).unwrap()),
                     }
                 }
             };
-            self.ptr = uniq;
+            self.ptr = uniq.cast();
             self.cap = new_cap;
         }
     }
@@ -353,7 +354,7 @@ impl<'a, T> RawVec<'a, T> {
     pub fn reserve_exact(&mut self, used_cap: usize, needed_extra_cap: usize) {
         match self.reserve_internal(used_cap, needed_extra_cap, Infallible, Exact) {
             Err(CapacityOverflow) => capacity_overflow(),
-            Err(AllocErr) => unreachable!(),
+            Err(_) => unreachable!(),
             Ok(()) => { /* yay */ }
         }
     }
@@ -440,7 +441,7 @@ impl<'a, T> RawVec<'a, T> {
     pub fn reserve(&mut self, used_cap: usize, needed_extra_cap: usize) {
         match self.reserve_internal(used_cap, needed_extra_cap, Infallible, Amortized) {
             Err(CapacityOverflow) => capacity_overflow(),
-            Err(AllocErr) => unreachable!(),
+            Err(_) => unreachable!(),
             Ok(()) => { /* yay */ }
         }
     }
@@ -551,8 +552,8 @@ impl<'a, T> RawVec<'a, T> {
                 let new_size = elem_size * amount;
                 let align = mem::align_of::<T>();
                 let old_layout = Layout::from_size_align_unchecked(old_size, align);
-                match self.a.realloc(self.ptr.cast(), old_layout, new_size) {
-                    Ok(p) => self.ptr = p.cast(),
+                match realloc_with(&mut self.a, self.ptr.cast(), old_layout, new_size) {
+                    Ok((p, _)) => self.ptr = p.cast(),
                     Err(_) => {
                         handle_alloc_error(Layout::from_size_align_unchecked(new_size, align))
                     }
@@ -586,8 +587,6 @@ impl<'a, T> RawVec<'a, T> {
         strategy: ReserveStrategy,
     ) -> Result<(), CollectionAllocErr> {
         unsafe {
-            use crate::alloc::AllocErr;
-
             // NOTE: we don't early branch on ZSTs here because we want this
             // to actually catch "asking for more than usize::MAX" in that case.
             // If we make it past the first branch then we are guaranteed to
@@ -613,9 +612,10 @@ impl<'a, T> RawVec<'a, T> {
             let res = match self.current_layout() {
                 Some(layout) => {
                     debug_assert!(new_layout.align() == layout.align());
-                    self.a.realloc(self.ptr.cast(), layout, new_layout.size())
+                    realloc_with(&mut self.a, self.ptr.cast(), layout, new_layout.size())
+                        .map(|(ptr, _)| ptr)
                 }
-                None => Alloc::alloc(&mut self.a, new_layout),
+                None => alloc_with(&mut self.a, new_layout).map(|(ptr, _)| ptr),
             };
 
             if let (Err(AllocErr), Infallible) = (&res, fallibility) {
@@ -667,6 +667,44 @@ fn alloc_guard(alloc_size: usize) -> Result<(), CollectionAllocErr> {
     } else {
         Ok(())
     }
+}
+
+#[rustversion::since(2020-01-30)]
+#[inline]
+unsafe fn alloc_with<A: AllocRef>(a: &mut A, layout: Layout) -> Result<(NonNull<u8>, usize), AllocErr> {
+    AllocRef::alloc(a, layout)
+}
+
+#[rustversion::since(2020-01-30)]
+#[inline]
+unsafe fn alloc_zeroed_with<A: AllocRef>(a: &mut A, layout: Layout) -> Result<(NonNull<u8>, usize), AllocErr> {
+    AllocRef::alloc_zeroed(a, layout)
+}
+
+#[rustversion::since(2020-01-30)]
+#[inline]
+unsafe fn realloc_with<A: AllocRef>(a: &mut A, ptr: NonNull<u8>, layout: Layout, new_size: usize) -> Result<(NonNull<u8>, usize), AllocErr> {
+    AllocRef::realloc(a, ptr, layout, new_size)
+}
+
+#[rustversion::before(2020-01-30)]
+#[inline]
+unsafe fn alloc_with<A: AllocRef>(a: &mut A, layout: Layout) -> Result<(NonNull<u8>, usize), AllocErr> {
+    let layout_size = layout.size();
+    AllocRef::alloc(a, layout).map(|ptr| (ptr, layout_size))
+}
+
+#[rustversion::before(2020-01-30)]
+#[inline]
+unsafe fn alloc_zeroed_with<A: AllocRef>(a: &mut A, layout: Layout) -> Result<(NonNull<u8>, usize), AllocErr> {
+    let layout_size = layout.size();
+    AllocRef::alloc_zeroed(a, layout).map(|ptr| (ptr, layout_size))
+}
+
+#[rustversion::before(2020-01-30)]
+#[inline]
+unsafe fn realloc_with<A: AllocRef>(a: &mut A, ptr: NonNull<u8>, layout: Layout, new_size: usize) -> Result<(NonNull<u8>, usize), AllocErr> {
+    AllocRef::realloc(a, ptr, layout, new_size).map(|ptr| (ptr, new_size))
 }
 
 // One central function responsible for reporting capacity overflows. This'll

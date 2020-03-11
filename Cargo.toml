@@ -20,7 +20,8 @@ path = "benches/benches.rs"
 harness = false
 
 [dependencies]
-hashbrown = { git = "https://github.com/hansihe/hashbrown.git", optional = true }
+rustversion = "1.0"
+hashbrown = { git = "https://github.com/bitwalker/hashbrown.git", optional = true }
 
 [dev-dependencies]
 quickcheck = "0.8.2"

@@ -100,7 +100,6 @@ Bumpalo is a `no_std` crate. It depends only on the `alloc` and `core` crates.
  */
 
 #![deny(missing_debug_implementations)]
-#![deny(missing_docs)]
 #![no_std]
 
 #![cfg_attr(feature = "unstable_core_alloc", feature(allocator_api, alloc_layout_extra))]
@@ -253,7 +252,7 @@ const OVERHEAD: usize = (MALLOC_OVERHEAD + FOOTER_SIZE + (CHUNK_ALIGN - 1)) & !(
 // Choose a relatively small default initial chunk size, since we double chunk
 // sizes as we grow bump arenas to amortize costs of hitting the global
 // allocator.
-const FIRST_ALLOCATION_GOAL: usize = (1 << 9);
+const FIRST_ALLOCATION_GOAL: usize = 1 << 9;
 
 // The actual size of the first allocation is going to be a bit smaller
 // than the goal. We need to make room for the footer, and we also need
@@ -1071,7 +1070,8 @@ fn oom() -> ! {
     panic!("out of memory")
 }
 
-unsafe impl<'a> alloc::Alloc for &'a Bump {
+#[rustversion::before(2020-01-30)]
+unsafe impl<'a> alloc::AllocRef for &'a Bump {
     #[inline(always)]
     unsafe fn alloc(&mut self, layout: Layout) -> Result<NonNull<u8>, alloc::AllocErr> {
         Ok(self.alloc_layout(layout))
@@ -1140,6 +1140,81 @@ unsafe impl<'a> alloc::Alloc for &'a Bump {
         let new_ptr = self.alloc_layout(new_layout);
         ptr::copy_nonoverlapping(ptr.as_ptr(), new_ptr.as_ptr(), old_size);
         Ok(new_ptr)
+    }
+}
+
+#[rustversion::since(2020-01-30)]
+unsafe impl<'a> alloc::AllocRef for &'a Bump {
+    #[inline(always)]
+    unsafe fn alloc(&mut self, layout: Layout) -> Result<(NonNull<u8>, usize), alloc::AllocErr> {
+        let layout_size = layout.size();
+        Ok((self.alloc_layout(layout), layout_size))
+    }
+
+    #[inline]
+    unsafe fn dealloc(&mut self, ptr: NonNull<u8>, layout: Layout) {
+        // If the pointer is the last allocation we made, we can reuse the bytes,
+        // otherwise they are simply leaked -- at least until somebody calls reset().
+        if layout.size() != 0 && self.is_last_allocation(ptr) {
+            let ptr = NonNull::new_unchecked(ptr.as_ptr().add(layout.size()));
+            self.current_chunk_footer.get().as_ref().ptr.set(ptr);
+        }
+    }
+
+    #[inline]
+    unsafe fn realloc(
+        &mut self,
+        ptr: NonNull<u8>,
+        layout: Layout,
+        new_size: usize,
+    ) -> Result<(NonNull<u8>, usize), alloc::AllocErr> {
+        let old_size = layout.size();
+
+        if old_size == 0 {
+            return self.alloc(layout);
+        }
+
+        if new_size <= old_size {
+            if self.is_last_allocation(ptr)
+                // Only reclaim the excess space (which requires a copy) if it
+                // is worth it: we are actually going to recover "enough" space
+                // and we can do a non-overlapping copy.
+                && new_size <= old_size / 2
+            {
+                let delta = old_size - new_size;
+                let footer = self.current_chunk_footer.get();
+                let footer = footer.as_ref();
+                footer
+                    .ptr
+                    .set(NonNull::new_unchecked(footer.ptr.get().as_ptr().add(delta)));
+                let new_ptr = footer.ptr.get();
+                // NB: we know it is non-overlapping because of the size check
+                // in the `if` condition.
+                ptr::copy_nonoverlapping(ptr.as_ptr(), new_ptr.as_ptr(), new_size);
+                return Ok((new_ptr, new_size));
+            } else {
+                return Ok((ptr, new_size));
+            }
+        }
+
+        if self.is_last_allocation(ptr) {
+            // Try to allocate the delta size within this same block so we can
+            // reuse the currently allocated space.
+            let delta = new_size - old_size;
+            if let Some(p) =
+                self.try_alloc_layout_fast(layout_from_size_align(delta, layout.align()))
+            {
+                ptr::copy(ptr.as_ptr(), p.as_ptr(), new_size);
+                return Ok((p, new_size));
+            }
+        }
+
+        // Fallback: do a fresh allocation and copy the existing data into it.
+        let new_layout = layout_from_size_align(new_size, layout.align());
+        let new_layout_size = new_layout.size();
+        let new_ptr = self.alloc_layout(new_layout);
+        ptr::copy_nonoverlapping(ptr.as_ptr(), new_ptr.as_ptr(), old_size);
+        Ok((new_ptr, new_layout_size))
     }
 }
 
